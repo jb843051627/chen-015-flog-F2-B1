@@ -24,7 +24,14 @@ CREATE TABLE IF NOT EXISTS t_flog_apply_card (
   update_by varchar(64) DEFAULT NULL COMMENT '更新者',
   update_time datetime DEFAULT NULL COMMENT '更新时间',
   remark varchar(500) DEFAULT NULL COMMENT '备注',
-  PRIMARY KEY (id)
+  PRIMARY KEY (id),
+  -- 同一底档下，正常卡（del_flag=0）的建档卡号唯一；软删行键值为 NULL 不参与约束。
+  -- 与 service 的 dupExists(site_id, bill_no, 排除自身) 同一口径：
+  --   ① 全局唯一会误拦不同底档各自编号，必须收敛到同底档；
+  --   ② 并发双击/存量导入绕过应用层时由数据库兜底；
+  --   ③ 软删后卡号可重新使用。
+  UNIQUE KEY uk_apply_card_site_bill_active
+    ((CASE WHEN del_flag = 0 THEN site_id END), (CASE WHEN del_flag = 0 THEN bill_no END))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='伐区采伐申请建档卡';
 
 CREATE TABLE IF NOT EXISTS t_flog_close_card (
@@ -137,4 +144,125 @@ CREATE TABLE IF NOT EXISTS t_flog_yield_rule (
 INSERT IGNORE INTO t_flog_stand_doc (id, site_no, site_name, site_type, road_name, th1_max, th2_max, th3_max, status, del_flag, create_by, create_time)
 VALUES (0, 'DC00', '青屏县编制单位在册底档（青屏国有林场，在册）', '国有林场', '青屏省—青屏市—青屏县', 40.00, 120.00, 300.00, 0, 0, 'seed', NOW()),
        (1, 'DC01', '青屏县编制单位在册底档（白石集体林场，已收回）', '集体林场', '青屏省—青屏市—青屏县', 40.00, 120.00, 300.00, 1, 0, 'seed', NOW());
+
+-- ============================================================================
+-- 存量数据对齐：老规矩与新规矩一个口径。
+-- 顺序不可乱：先清洗 → 回填字号/档位 → 人工处理停用底档/重复/未挂钩 → 再建唯一索引 → 回溯经办人。
+-- 全角字母/全角空格的归一在应用层搬入口（/FlogApplyCardController/importData）完成，
+-- 纯 SQL 只处理首尾空白与大小写。
+-- ============================================================================
+
+-- ① 卡号归一：去首尾空白、统一大写（对应 service.dupKey 的 SQL 可达部分）
+UPDATE t_flog_apply_card
+SET bill_no = UPPER(TRIM(bill_no))
+WHERE bill_no IS NOT NULL AND bill_no <> UPPER(TRIM(bill_no));
+
+-- ② 冗余字号以底档为准回填（老数据 site_no 与底档不一致/为空的全部纠正）
+UPDATE t_flog_apply_card c
+JOIN t_flog_stand_doc d ON d.id = c.site_id AND d.del_flag = 0
+SET c.site_no = d.site_no
+WHERE c.del_flag = 0
+  AND (c.site_no IS NULL OR c.site_no <> d.site_no);
+
+-- ③ 待人工处理清单 A：挂在已停用(1)/状态为空/已删底档下的卡
+--    （新规矩 status 为空按未启用保守处理，与 service.refUsable 同口径；存量先改挂在册底档）
+-- SELECT c.id, c.bill_no, c.site_id, d.status
+-- FROM t_flog_apply_card c
+-- LEFT JOIN t_flog_stand_doc d ON d.id = c.site_id AND d.del_flag = 0
+-- WHERE c.del_flag = 0 AND (d.id IS NULL OR d.status = 1 OR d.status IS NULL);
+
+-- ④ 待人工处理清单 B：同底档下归一后仍重复的卡号（不清零，唯一索引建不上）
+-- SELECT site_id, bill_no, COUNT(*) AS cnt, GROUP_CONCAT(id ORDER BY create_time, id) AS dup_ids
+-- FROM t_flog_apply_card
+-- WHERE del_flag = 0 AND bill_no IS NOT NULL
+-- GROUP BY site_id, bill_no HAVING COUNT(*) > 1;
+-- 处理口径：保留最早一条（最小 create_time,id），其余 UPDATE del_flag=1 软删。
+
+-- ⑤ 待人工处理清单 C：卡号未挂底档字号（非「字号-」开头）的存量行，与 requireBillBelongsToSite 同口径改号：
+-- SELECT c.id, c.bill_no, d.site_no
+-- FROM t_flog_apply_card c
+-- JOIN t_flog_stand_doc d ON d.id = c.site_id
+-- WHERE c.del_flag = 0 AND c.bill_no IS NOT NULL
+--   AND c.bill_no <> UPPER(d.site_no)
+--   AND c.bill_no NOT LIKE CONCAT(UPPER(d.site_no), '-%');
+
+-- ⑥ 存量档位按底档现行阈值统一重算落库（含起不含止、等于上限算高一档，与 bandLevelOf 一致）
+UPDATE t_flog_apply_card c
+JOIN t_flog_stand_doc d ON d.id = c.site_id AND d.del_flag = 0
+SET c.grade_level = CASE
+        WHEN c.qty IS NULL OR c.qty <= 0 THEN 0
+        WHEN d.th1_max IS NOT NULL AND c.qty <= d.th1_max THEN 1
+        WHEN d.th1_max IS NOT NULL AND d.th2_max IS NOT NULL AND c.qty <= d.th2_max THEN 2
+        WHEN d.th2_max IS NOT NULL AND d.th3_max IS NOT NULL AND c.qty <= d.th3_max THEN 3
+        ELSE 4
+    END,
+    c.update_time = NOW(),
+    c.update_by = 'migration-recalc'
+WHERE c.del_flag = 0;
+
+-- ⑦ 历史「创建人被卡号顶掉」回溯：操作日志按真实登录人记录 oper_name，
+--    oper_param 形如 {"billNo":["DC00-2026-001"],...}。
+--    每卡取最早一条新增日志的登录人回填 create_by（只回填被污染/为空的，不覆盖已正确的值）。
+UPDATE t_flog_apply_card c
+JOIN (
+    SELECT c2.id AS card_id, MIN(l.create_time) AS first_log_time
+    FROM t_flog_apply_card c2
+    JOIN t_sys_oper_log l
+      ON l.oper_url = '/FlogApplyCardController/add'
+     AND l.oper_param LIKE CONCAT('%"billNo":["', c2.bill_no, '"]%')
+    WHERE c2.del_flag = 0
+    GROUP BY c2.id
+) f ON f.card_id = c.id
+JOIN t_sys_oper_log l
+  ON l.oper_url = '/FlogApplyCardController/add'
+ AND l.oper_param LIKE CONCAT('%"billNo":["', c.bill_no, '"]%')
+ AND l.create_time = f.first_log_time
+SET c.create_by = l.oper_name
+WHERE c.del_flag = 0
+  AND (c.create_by IS NULL OR UPPER(TRIM(c.create_by)) = c.bill_no);
+
+-- ⑧ 唯一索引（幂等）。必须在 ③④⑤ 清单清零后执行。
+DROP PROCEDURE IF EXISTS p_add_uk_apply_card;
+DELIMITER $$
+CREATE PROCEDURE p_add_uk_apply_card()
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.statistics
+                   WHERE table_schema = DATABASE()
+                     AND table_name = 't_flog_apply_card'
+                     AND index_name = 'uk_apply_card_site_bill_active') THEN
+        ALTER TABLE t_flog_apply_card
+            ADD UNIQUE KEY uk_apply_card_site_bill_active
+              ((CASE WHEN del_flag = 0 THEN site_id END),
+               (CASE WHEN del_flag = 0 THEN bill_no END));
+    END IF;
+END$$
+DELIMITER ;
+CALL p_add_uk_apply_card();
+DROP PROCEDURE IF EXISTS p_add_uk_apply_card;
+
+-- ⑨ 菜单/权限种子：顶级目录「林木采伐管理」(910000) + 建卡菜单(910001) + 六个按钮点
+INSERT IGNORE INTO t_sys_permission
+    (id, name, descripion, url, is_blank, pid, perms, type, icon, order_num, visible, create_by, create_time)
+VALUES
+    (910000, '林木采伐管理', NULL, '', 0, 0, '', 0, 'layui-icon-template-1', 90, 0, 'seed', NOW()),
+    (910001, '伐区采伐申请建档卡', '伐区采伐申请建档卡菜单', '/FlogApplyCardController/view', 0, 910000, 'flog:flogApplyCard:view', 1, 'layui-icon-read', 1, 0, 'seed', NOW()),
+    (910002, '建档卡集合查询', '建档卡集合查询', '/FlogApplyCardController/list', 0, 910001, 'flog:flogApplyCard:list', 2, NULL, 1, 0, 'seed', NOW()),
+    (910003, '建档卡新增', '建档卡新增', '/FlogApplyCardController/add', 0, 910001, 'flog:flogApplyCard:add', 2, 'entypo-plus-squared', 2, 0, 'seed', NOW()),
+    (910004, '建档卡修改', '建档卡修改', '/FlogApplyCardController/edit', 0, 910001, 'flog:flogApplyCard:edit', 2, 'fa fa-wrench', 3, 0, 'seed', NOW()),
+    (910005, '建档卡删除', '建档卡删除', '/FlogApplyCardController/remove', 0, 910001, 'flog:flogApplyCard:remove', 2, 'entypo-trash', 4, 0, 'seed', NOW()),
+    (910006, '建档卡重算落库', '建档卡档位重算落库', '/FlogApplyCardController/recalc', 0, 910001, 'flog:flogApplyCard:recalc', 2, 'layui-icon-refresh-3', 5, 0, 'seed', NOW()),
+    (910007, '建档卡存量搬入', '建档卡存量数据批量搬入', '/FlogApplyCardController/importData', 0, 910001, 'flog:flogApplyCard:import', 2, 'layui-icon-upload-drag', 6, 0, 'seed', NOW());
+
+-- ⑩ 管理员角色（488243256161730560）授予目录+七个权限点，其他角色按需在权限管理里勾选
+INSERT IGNORE INTO t_sys_permission_role
+    (id, role_id, permission_id, create_by, create_time)
+VALUES
+    (911000, 488243256161730560, 910000, 'seed', NOW()),
+    (911001, 488243256161730560, 910001, 'seed', NOW()),
+    (911002, 488243256161730560, 910002, 'seed', NOW()),
+    (911003, 488243256161730560, 910003, 'seed', NOW()),
+    (911004, 488243256161730560, 910004, 'seed', NOW()),
+    (911005, 488243256161730560, 910005, 'seed', NOW()),
+    (911006, 488243256161730560, 910006, 'seed', NOW()),
+    (911007, 488243256161730560, 910007, 'seed', NOW());
 

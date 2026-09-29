@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="zh" xmlns:th="http://www.thymeleaf.org">
+<head>
+    <th:block th:include="include :: header('伐区采伐申请建档卡新增')"/>
+</head>
+<body>
+<form class="layui-form">
+    <div class="mainBox">
+        <div class="main-container">
+            <div class="layui-form-item">
+                <label class="layui-form-label">编制单位底档</label>
+                <div class="layui-input-block">
+                    <select id="siteId" name="siteId" lay-filter="siteId" lay-verify="required">
+                        <option value="">请选择在册底档</option>
+                        <option th:each="s : ${siteList}"
+                                th:value="${s.id}"
+                                th:disabled="${s.status != null && s.status == 1}"
+                                th:text="${s.siteNo + ' - ' + s.siteName + (s.status != null && s.status == 1 ? '（已停用）' : '')}">
+                        </option>
+                    </select>
+                </div>
+            </div>
+            <div class="layui-form-item">
+                <label class="layui-form-label">建档卡号</label>
+                <div class="layui-input-block">
+                    <input type="text" id="billNo" name="billNo" autocomplete="off"
+                           placeholder="必须以所选底档字号开头，如 DC00-2026-001" class="layui-input">
+                </div>
+            </div>
+            <div class="layui-form-item">
+                <label class="layui-form-label">小班号</label>
+                <div class="layui-input-block">
+                    <input type="text" name="subcompNo" autocomplete="off" placeholder="小班号" class="layui-input">
+                </div>
+            </div>
+            <div class="layui-form-item">
+                <label class="layui-form-label">伐区名号</label>
+                <div class="layui-input-block">
+                    <input type="text" name="cutBlockNo" autocomplete="off" placeholder="伐区名号" class="layui-input">
+                </div>
+            </div>
+            <div class="layui-form-item">
+                <label class="layui-form-label">采伐方式</label>
+                <div class="layui-input-block">
+                    <select name="cutMode">
+                        <option value="">请选择</option>
+                        <option value="1">皆伐</option>
+                        <option value="2">渐伐</option>
+                        <option value="3">择伐</option>
+                        <option value="4">抚育采伐</option>
+                        <option value="5">更新采伐</option>
+                        <option value="6">低质低效林改造</option>
+                    </select>
+                </div>
+            </div>
+            <div class="layui-form-item">
+                <label class="layui-form-label">拟采蓄积(m³)</label>
+                <div class="layui-input-block">
+                    <input type="number" step="0.01" min="0.01" id="qty" name="qty" autocomplete="off"
+                           placeholder="本卡合并后拟采蓄积，必须大于0" class="layui-input">
+                </div>
+            </div>
+            <div class="layui-form-item">
+                <label class="layui-form-label">拟采面积(公顷)</label>
+                <div class="layui-input-block">
+                    <input type="number" step="0.01" min="0" name="fineAmt" autocomplete="off"
+                           placeholder="本卡新报拟采面积" class="layui-input">
+                </div>
+            </div>
+            <div class="layui-form-item">
+                <label class="layui-form-label">备注</label>
+                <div class="layui-input-block">
+                    <textarea name="remark" class="layui-textarea" placeholder="备注"></textarea>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="bottom">
+        <div class="button-container">
+            <button type="submit" class="layui-btn layui-btn-normal layui-btn-sm" lay-submit lay-filter="applyCard-save">
+                <i class="layui-icon layui-icon-ok"></i>
+                提交
+            </button>
+            <button type="reset" class="layui-btn layui-btn-primary layui-btn-sm">
+                <i class="layui-icon layui-icon-refresh"></i>
+                重置
+            </button>
+        </div>
+    </div>
+</form>
+<th:block th:include="include :: footer"/>
+<script th:inline="javascript">
+    layui.use(['form', 'jquery'], function () {
+        let form = layui.form;
+        let $ = layui.jquery;
+        let MODULE_PATH = rootPath + "/FlogApplyCardController";
+
+        function selectedSiteNo() {
+            // 从下拉文本取字号（文本形如 “DC00 - 名称”），与后端 requireBillBelongsToSite 同一前缀口径
+            let txt = $('#siteId option:selected').text();
+            let m = txt.match(/^\s*([^\s-]+)\s*-/);
+            return m ? m[1] : '';
+        }
+
+        // 选底档后，若卡号为空自动带上字号前缀，减少手填出错；已填则只校验不覆盖
+        form.on('select(siteId)', function () {
+            let no = selectedSiteNo();
+            let bill = $('#billNo').val().trim();
+            if (no && (!bill || bill.indexOf(no) !== 0)) {
+                $('#billNo').val(no + '-');
+            }
+        });
+
+        // 实时同底档判重：与保存共用后端 checkBillNoUnique 一个口径
+        $('#billNo').on('blur', function () {
+            let siteId = $('#siteId').val();
+            let billNo = $(this).val().trim();
+            if (!siteId || !billNo) {
+                return;
+            }
+            let no = selectedSiteNo();
+            if (no && billNo.toUpperCase().indexOf(no.toUpperCase()) !== 0) {
+                layer.tips('建档卡号必须以底档字号「' + no + '-」开头', '#billNo', {tips: 2});
+                return;
+            }
+            $.ajax({
+                url: MODULE_PATH + '/checkBillNoUnique',
+                data: {siteId: siteId, billNo: billNo},
+                dataType: 'json', type: 'post', async: false,
+                success: function (dup) {
+                    if (dup == 1) {
+                        layer.tips('该底档下建档卡号已存在，请勿重复建卡', '#billNo', {tips: 2});
+                    }
+                }
+            });
+        });
+
+        form.on('submit(applyCard-save)', function (data) {
+            let f = data.field;
+            if (!f.siteId) {
+                layer.msg('请选择编制单位底档', {icon: 2});
+                return false;
+            }
+            let no = selectedSiteNo();
+            let bill = (f.billNo || '').trim();
+            if (!bill) {
+                layer.msg('请填写建档卡号', {icon: 2});
+                return false;
+            }
+            if (no && bill.toUpperCase().indexOf(no.toUpperCase()) !== 0) {
+                layer.msg('建档卡号必须以底档字号「' + no + '-」开头', {icon: 2});
+                return false;
+            }
+            if (!f.qty || parseFloat(f.qty) <= 0) {
+                layer.msg('拟采蓄积必须大于0', {icon: 2});
+                return false;
+            }
+            $.ajax({
+                url: MODULE_PATH + '/add',
+                data: f,
+                dataType: 'json',
+                contentType: 'application/x-www-form-urlencoded',
+                type: 'post',
+                success: function (result) {
+                    if (result.code == 200) {
+                        layer.msg(result.msg, {icon: 1, time: 1000}, function () {
+                            parent.layer.close(parent.layer.getFrameIndex(window.name));
+                            parent.layui.table.reload('applyCard-table');
+                        });
+                    } else {
+                        // 重复/停用底档/卡号未挂底档等统一从后端文案回显，不做第二套口径
+                        layer.msg(result.msg, {icon: 2, time: 2500});
+                    }
+                }
+            });
+            return false;
+        });
+    })
+</script>
+</body>
+</html>

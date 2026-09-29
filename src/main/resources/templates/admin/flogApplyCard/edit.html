@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="zh" xmlns:th="http://www.thymeleaf.org">
+<head>
+    <th:block th:include="include :: header('伐区采伐申请建档卡修改')"/>
+</head>
+<body>
+<form class="layui-form" th:object="${FlogApplyCard}">
+    <div class="mainBox">
+        <div class="main-container">
+            <div class="layui-form-item layui-hide">
+                <label class="layui-form-label">主键</label>
+                <div class="layui-input-block">
+                    <input type="text" th:value="*{id}" name="id" autocomplete="off" class="layui-input">
+                </div>
+            </div>
+            <div class="layui-form-item">
+                <label class="layui-form-label">编制单位底档</label>
+                <div class="layui-input-block">
+                    <select id="siteId" name="siteId" lay-filter="siteId">
+                        <option th:each="s : ${siteList}"
+                                th:value="${s.id}"
+                                th:selected="${FlogApplyCard.siteId != null && s.id.longValue() == FlogApplyCard.siteId.longValue()}"
+                                th:disabled="${s.status != null && s.status == 1}"
+                                th:text="${s.siteNo + ' - ' + s.siteName + (s.status != null && s.status == 1 ? '（已停用，不可改挂）' : '')}">
+                        </option>
+                    </select>
+                    <div th:if="${FlogApplyCard != null && FlogApplyCard.siteId != null}"
+                         style="color:#999;font-size:12px;margin-top:4px;">
+                        改挂其他底档时，建档卡号需以新底档字号开头。
+                    </div>
+                </div>
+            </div>
+            <div class="layui-form-item">
+                <label class="layui-form-label">建档卡号</label>
+                <div class="layui-input-block">
+                    <input th:value="*{billNo}" type="text" id="billNo" name="billNo" autocomplete="off"
+                           placeholder="必须以所选底档字号开头" class="layui-input">
+                </div>
+            </div>
+            <div class="layui-form-item">
+                <label class="layui-form-label">小班号</label>
+                <div class="layui-input-block">
+                    <input th:value="*{subcompNo}" type="text" name="subcompNo" autocomplete="off" class="layui-input">
+                </div>
+            </div>
+            <div class="layui-form-item">
+                <label class="layui-form-label">伐区名号</label>
+                <div class="layui-input-block">
+                    <input th:value="*{cutBlockNo}" type="text" name="cutBlockNo" autocomplete="off" class="layui-input">
+                </div>
+            </div>
+            <div class="layui-form-item">
+                <label class="layui-form-label">采伐方式</label>
+                <div class="layui-input-block">
+                    <select name="cutMode">
+                        <option value="">请选择</option>
+                        <option value="1" th:selected="*{cutMode == 1}">皆伐</option>
+                        <option value="2" th:selected="*{cutMode == 2}">渐伐</option>
+                        <option value="3" th:selected="*{cutMode == 3}">择伐</option>
+                        <option value="4" th:selected="*{cutMode == 4}">抚育采伐</option>
+                        <option value="5" th:selected="*{cutMode == 5}">更新采伐</option>
+                        <option value="6" th:selected="*{cutMode == 6}">低质低效林改造</option>
+                    </select>
+                </div>
+            </div>
+            <div class="layui-form-item">
+                <label class="layui-form-label">拟采蓄积(m³)</label>
+                <div class="layui-input-block">
+                    <input th:value="*{qty}" type="number" step="0.01" min="0.01" id="qty" name="qty"
+                           autocomplete="off" class="layui-input">
+                </div>
+            </div>
+            <div class="layui-form-item">
+                <label class="layui-form-label">拟采面积(公顷)</label>
+                <div class="layui-input-block">
+                    <input th:value="*{fineAmt}" type="number" step="0.01" min="0" name="fineAmt"
+                           autocomplete="off" class="layui-input">
+                </div>
+            </div>
+            <div class="layui-form-item">
+                <label class="layui-form-label">备注</label>
+                <div class="layui-input-block">
+                    <textarea name="remark" class="layui-textarea" th:text="*{remark}"></textarea>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="bottom">
+        <div class="button-container">
+            <button type="submit" class="layui-btn layui-btn-normal layui-btn-sm" lay-submit lay-filter="applyCard-update">
+                <i class="layui-icon layui-icon-ok"></i>
+                提交
+            </button>
+            <button type="reset" class="layui-btn layui-btn-primary layui-btn-sm">
+                <i class="layui-icon layui-icon-refresh"></i>
+                重置
+            </button>
+        </div>
+    </div>
+</form>
+<th:block th:include="include :: footer"/>
+<script th:inline="javascript">
+    layui.use(['form', 'jquery'], function () {
+        let form = layui.form;
+        let $ = layui.jquery;
+        let MODULE_PATH = rootPath + "/FlogApplyCardController";
+        let cardId = [[${FlogApplyCard != null ? FlogApplyCard.id : null}]];
+
+        function selectedSiteNo() {
+            let txt = $('#siteId option:selected').text();
+            let m = txt.match(/^\s*([^\s-]+)\s*-/);
+            return m ? m[1] : '';
+        }
+
+        // 判重带 id：后端排除自身，卡号没动不会误报重复
+        $('#billNo').on('blur', function () {
+            let siteId = $('#siteId').val();
+            let billNo = $(this).val().trim();
+            if (!siteId || !billNo) {
+                return;
+            }
+            let no = selectedSiteNo();
+            if (no && billNo.toUpperCase().indexOf(no.toUpperCase()) !== 0) {
+                layer.tips('建档卡号必须以底档字号「' + no + '-」开头', '#billNo', {tips: 2});
+                return;
+            }
+            $.ajax({
+                url: MODULE_PATH + '/checkBillNoUnique',
+                data: {id: cardId, siteId: siteId, billNo: billNo},
+                dataType: 'json', type: 'post', async: false,
+                success: function (dup) {
+                    if (dup == 1) {
+                        layer.tips('该底档下建档卡号已存在', '#billNo', {tips: 2});
+                    }
+                }
+            });
+        });
+
+        form.on('submit(applyCard-update)', function (data) {
+            let f = data.field;
+            let no = selectedSiteNo();
+            let bill = (f.billNo || '').trim();
+            if (!bill) {
+                layer.msg('请填写建档卡号', {icon: 2});
+                return false;
+            }
+            if (no && bill.toUpperCase().indexOf(no.toUpperCase()) !== 0) {
+                layer.msg('建档卡号必须以底档字号「' + no + '-」开头', {icon: 2});
+                return false;
+            }
+            if (!f.qty || parseFloat(f.qty) <= 0) {
+                layer.msg('拟采蓄积必须大于0', {icon: 2});
+                return false;
+            }
+            $.ajax({
+                url: MODULE_PATH + '/edit',
+                data: f,
+                dataType: 'json',
+                contentType: 'application/x-www-form-urlencoded',
+                type: 'post',
+                success: function (result) {
+                    if (result.code == 200) {
+                        layer.msg(result.msg, {icon: 1, time: 1000}, function () {
+                            parent.layer.close(parent.layer.getFrameIndex(window.name));
+                            parent.layui.table.reload('applyCard-table');
+                        });
+                    } else {
+                        layer.msg(result.msg, {icon: 2, time: 2500});
+                    }
+                }
+            });
+            return false;
+        });
+    })
+</script>
+</body>
+</html>

@@ -1,22 +1,28 @@
 package com.fc.v2.service.impl;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Date;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 import com.baomidou.mybatisplus.core.conditions.Wrapper;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.update.UpdateWrapper;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.fc.v2.common.exception.BusinessException;
 import com.fc.v2.common.support.ConvertUtil;
 import com.fc.v2.mapper.auto.TFlogApplyCardMapper;
 import com.fc.v2.mapper.auto.TFlogStandDocMapper;
 import com.fc.v2.model.auto.TFlogApplyCard;
 import com.fc.v2.model.auto.TFlogStandDoc;
 import com.fc.v2.service.ITFlogApplyCardService;
+import com.fc.v2.shiro.util.ShiroUtils;
 import com.fc.v2.util.StringUtils;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 /**
@@ -28,11 +34,17 @@ import org.springframework.stereotype.Service;
 @Service
 public class TFlogApplyCardServiceImpl extends ServiceImpl<TFlogApplyCardMapper, TFlogApplyCard> implements ITFlogApplyCardService {
 
-    @Autowired
-    private TFlogStandDocMapper flogStandDocMapper;
+    private final TFlogStandDocMapper flogStandDocMapper;
+
+    public TFlogApplyCardServiceImpl(TFlogStandDocMapper flogStandDocMapper) {
+        this.flogStandDocMapper = flogStandDocMapper;
+    }
 
     @Override
     public TFlogApplyCard selectTFlogApplyCardById(Long id) {
+        if (id == null) {
+            return null;
+        }
         return this.baseMapper.selectOne(new QueryWrapper<TFlogApplyCard>()
                 .eq("id", id)
                 .eq("del_flag", 0));
@@ -40,76 +52,104 @@ public class TFlogApplyCardServiceImpl extends ServiceImpl<TFlogApplyCardMapper,
 
     @Override
     public List<TFlogApplyCard> selectTFlogApplyCardList(Wrapper<TFlogApplyCard> queryWrapper) {
-        QueryWrapper<TFlogApplyCard> wrapper = listNormalize(queryWrapper);
-        wrapper.eq("del_flag", 0).inSql("site_id", "select id from t_flog_stand_doc where status != 1 and del_flag = 0")
-                .orderByDesc("create_time").orderByDesc("id");
+        QueryWrapper<TFlogApplyCard> wrapper = (queryWrapper instanceof QueryWrapper)
+                ? (QueryWrapper<TFlogApplyCard>) queryWrapper
+                : new QueryWrapper<TFlogApplyCard>();
+        // 只摆现行卡；挂在已收回（status=1）底档名下的卡不再进台账
+        wrapper.eq("del_flag", 0)
+                .inSql("site_id", "select id from t_flog_stand_doc where status != 1 and del_flag = 0");
+        // 同秒数据按 id 兜底，分页不抖、不漏、不重
+        wrapper.orderByDesc("create_time").orderByDesc("id");
         return this.baseMapper.selectList(wrapper);
     }
 
     @Override
     public int insertTFlogApplyCard(TFlogApplyCard record) {
         if (record == null) {
-            return 0;
+            throw new BusinessException("建档卡内容不能为空");
         }
-        // 缺陷1：手动写创建人，覆盖自动填充
-        record.setCreateBy(record.getBillNo());
-        record.setCreateTime(new Date());
+        // 审计字段只准框架填：表单绑定可携带任意 createBy/updateBy/delFlag，
+        // 而 fillStrategy 只在字段为 null 时填登录人——非空值会顶掉真实经办人（历史同款 bug）。
+        sanitizeAuditFields(record);
+        // 数量先于一切：非法数量不得触发任何查询与留痕
+        BigDecimal qty = normalizeQty(record.getQty(), null);
+        record.setQty(qty);
 
-        if (record.getQty() == null || record.getQty().signum() <= 0) {
-            return 0;
+        // 卡号归一 + 必录
+        String key = dupKey(record.getBillNo());
+        if (StringUtils.isEmpty(key)) {
+            throw new BusinessException("伐区采伐申请建档卡号不能为空");
         }
-        // 缺陷5：登记时不查编制单位在册底档，直接持久化入参的冗余字段
-        // 缺陷3：新增不校验唯一性
-        BigDecimal bandVal = record.getQty();
-        TFlogStandDoc bandArch = this.flogStandDocMapper.selectById(record.getSiteId());
-        BigDecimal bandT1 = bandResolve(bandArch, 1);
-        BigDecimal bandT2 = bandResolve(bandArch, 2);
-        BigDecimal bandT3 = bandResolve(bandArch, 3);
-        int bandLevel = bandLevelOf(bandVal, bandT1, bandT2, bandT3, 1);
-        record.setGradeLevel(bandLevel);
-        bandSnapshot(record, bandArch);
+        // 底档：必须存在、未删、在册；停用底档不得新建卡
+        TFlogStandDoc arch = requireUsableArch(record.getSiteId());
+        // 卡号必须挂在该底档字号下，禁止手填与底档无关的号
+        requireBillBelongsToSite(key, arch);
+        // 同底档范围内判重（新增不排除任何行）
+        if (dupExists(record.getSiteId(), key, null)) {
+            throw new BusinessException("伐区采伐申请建档卡号「" + record.getBillNo().trim() + "」在该编制单位底档下已存在，请勿重复建卡");
+        }
 
+        record.setBillNo(key);
+        // 冗余字号一律以底档为准，入参带的旧值覆盖掉
+        record.setSiteNo(arch.getSiteNo());
+        applyGrade(record, qty, arch);
         record.setDelFlag(0);
+        // 创建人/创建时间一律走 MetaObjectHandler 自动填充（当前登录人），
+        // 严禁在业务里手动 setCreateBy —— 否则会被界面字段值顶掉，事后查不出经办人。
         return this.baseMapper.insert(record);
     }
 
     @Override
     public int updateTFlogApplyCard(TFlogApplyCard record) {
         if (record == null || record.getId() == null) {
-            return 0;
+            throw new BusinessException("缺少要修改的建档卡主键");
+        }
+        // 同新增：审计字段不接受表单入参，全部交框架填充（更新人）或不进 SET（创建人/创建时间）
+        sanitizeAuditFields(record);
+        TFlogApplyCard cur = selectTFlogApplyCardById(record.getId());
+        if (cur == null) {
+            throw new BusinessException("建档卡不存在或已删除");
         }
 
-        // 缺陷5：编辑不查底档、不校验停用状态
-        // 缺陷3：编辑判重没有排除自身
-        if (record.getId() != null && StringUtils.isNotEmpty(record.getBillNo())) {
-            if (dupExists(record, dupKey(record.getBillNo()), null)) {
-                dupReject(record, "update");
-                return 0;
-            }
+        // 本次生效的底档：提交了以提交为准，没提交沿用库中（在途单据只改备注不受牵连）
+        boolean siteChanged = record.getSiteId() != null && !record.getSiteId().equals(cur.getSiteId());
+        Integer siteId = record.getSiteId() != null ? record.getSiteId() : cur.getSiteId();
+        TFlogStandDoc arch;
+        if (siteChanged) {
+            // 主动换挂底档：新底档必须在册；仍挂原底档（哪怕原底档已停用）不算新引用，不拦
+            arch = requireUsableArch(siteId);
+        } else {
+            arch = refLoad(siteId);
         }
-        TFlogApplyCard calcCur = this.baseMapper.selectById(record.getId());
-        if (calcCur != null) {
-            if (record.getQty() == null) {
-                record.setQty(calcCur.getQty());
-            }
-            if (record.getSiteId() == null) {
-                record.setSiteId(calcCur.getSiteId());
-            }
-            BigDecimal bandVal = record.getQty();
-            TFlogStandDoc bandArch = this.flogStandDocMapper.selectById(record.getSiteId());
-            BigDecimal bandT1 = bandResolve(bandArch, 1);
-            BigDecimal bandT2 = bandResolve(bandArch, 2);
-            BigDecimal bandT3 = bandResolve(bandArch, 3);
-            int bandLevel = bandLevelOf(bandVal, bandT1, bandT2, bandT3, 1);
-            record.setGradeLevel(bandLevel);
-            bandSnapshot(record, bandArch);
-        }
-        if (record.getQty() == null || record.getQty().signum() <= 0) {
-        return 0;
-        }
-        record.setUpdateBy(com.fc.v2.shiro.util.ShiroUtils.getLoginName());
 
-        record.setUpdateTime(new Date());
+        // 卡号：提交了才归一/校验
+        String curKey = dupKey(cur.getBillNo());
+        if (StringUtils.isNotEmpty(record.getBillNo())) {
+            String key = dupKey(record.getBillNo());
+            boolean billChanged = !key.equals(curKey);
+            // 改号或换挂时才强制「卡号挂底档字号」；存量老卡只改备注不因历史号型被卡
+            if ((billChanged || siteChanged) && arch != null) {
+                requireBillBelongsToSite(key, arch);
+            }
+            // 关键：排除自身，编辑未改号（归一后与库值相同）不再误报重复
+            if (dupExists(siteId, key, record.getId())) {
+                throw new BusinessException("伐区采伐申请建档卡号「" + record.getBillNo().trim() + "」在该编制单位底档下已存在");
+            }
+            record.setBillNo(key);
+        }
+        // 底档字号以底档为准，入参带的旧值一律覆盖
+        if (arch != null) {
+            record.setSiteNo(arch.getSiteNo());
+        }
+        if (record.getSiteId() == null) {
+            record.setSiteId(siteId);
+        }
+
+        BigDecimal qty = normalizeQty(record.getQty(), cur.getQty());
+        record.setQty(qty);
+        applyGrade(record, qty, arch != null ? arch : refLoad(siteId));
+
+        // 更新人/更新时间走 FieldFill.UPDATE 自动填充，与新增同一口径，不手写
         return this.baseMapper.update(record, new UpdateWrapper<TFlogApplyCard>()
                 .eq("id", record.getId())
                 .eq("del_flag", 0));
@@ -118,16 +158,168 @@ public class TFlogApplyCardServiceImpl extends ServiceImpl<TFlogApplyCardMapper,
     @Override
     public int deleteTFlogApplyCardByIds(String ids) {
         Long[] idArr = ConvertUtil.toLongArray(ids);
-        return this.baseMapper.deleteBatchIds(Arrays.asList(idArr));
+        if (idArr == null || idArr.length == 0) {
+            return 0;
+        }
+        // 软删：与全表 del_flag 口径一致，删后卡号不参与判重、记录仍可追溯
+        UpdateWrapper<TFlogApplyCard> uw = new UpdateWrapper<TFlogApplyCard>()
+                .in("id", Arrays.asList(idArr))
+                .eq("del_flag", 0)
+                .set("del_flag", 1)
+                .set("update_time", new java.util.Date());
+        try {
+            uw.set("update_by", ShiroUtils.getLoginName());
+        } catch (RuntimeException ignore) {
+            // 无登录上下文（定时清理）时留空，不阻断删除
+        }
+        return this.baseMapper.update(null, uw);
     }
 
     @Override
     public int deleteTFlogApplyCardById(Long id) {
-        return this.baseMapper.deleteById(id);
+        if (id == null) {
+            return 0;
+        }
+        return deleteTFlogApplyCardByIds(String.valueOf(id));
     }
+
+    @Override
+    public int recalcTFlogApplyCardById(Long id) {
+        TFlogApplyCard cur = selectTFlogApplyCardById(id);
+        if (cur == null) {
+            throw new BusinessException("建档卡不存在或已删除，无法重算");
+        }
+        // 重算只按底档现行阈值刷新档位；底档停用不是新引用，不拦（阈值仍在档案上）
+        TFlogStandDoc arch = refLoad(cur.getSiteId());
+        if (arch == null) {
+            throw new BusinessException("挂靠的编制单位底档已不存在，无法重算，请先改挂在册底档");
+        }
+        int level = bandLevelOf(cur.getQty(),
+                bandResolve(arch, 1), bandResolve(arch, 2), bandResolve(arch, 3), 1);
+        cur.setGradeLevel(level);
+        // 整行是库里加载出来的，旧 update_by 非空会让 fillStrategy 跳过填充；
+        // 这里主动清空，强制把「谁点的重算」记成当前登录人，创建人/创建时间保持原值不动。
+        cur.setUpdateBy(null);
+        cur.setUpdateTime(null);
+        // 走整行 updateById：结果真正 UPDATE 落库（不再是只刷界面临时值），
+        // 并由 FieldFill.UPDATE 同步更新人/更新时间；刷新页面读到的就是新档。
+        return this.baseMapper.updateById(cur);
+    }
+
+    @Override
+    public List<TFlogStandDoc> listSiteOptions(Integer currentSiteId) {
+        List<TFlogStandDoc> rows = this.flogStandDocMapper.selectList(
+                new QueryWrapper<TFlogStandDoc>().eq("del_flag", 0).orderByAsc("id"));
+        Map<Long, TFlogStandDoc> merged = new LinkedHashMap<Long, TFlogStandDoc>();
+        for (TFlogStandDoc row : rows) {
+            merged.put(row.getId(), row);
+        }
+        // 现挂底档若已停用/已删，补进来给编辑页回显，前端置灰不可新选
+        if (currentSiteId != null && !merged.containsKey(currentSiteId.longValue())) {
+            TFlogStandDoc cur = this.flogStandDocMapper.selectById(currentSiteId);
+            if (cur != null) {
+                merged.put(cur.getId(), cur);
+            }
+        }
+        return new ArrayList<TFlogStandDoc>(merged.values());
+    }
+
+    @Override
+    public int countBillNoDuplicate(Long excludeId, Integer siteId, String billNo) {
+        if (siteId == null) {
+            // 底档未选定先不报重，由提交校验兜底
+            return 0;
+        }
+        String key = dupKey(billNo);
+        if (StringUtils.isEmpty(key)) {
+            return 0;
+        }
+        return dupExists(siteId, key, excludeId) ? 1 : 0;
+    }
+
+    /**
+     * 存量批量搬入（判重链第 3 处）：与手工新增共用同一套校验口径，不另起炉灶。
+     * 顺序：先整批校验（含批内同号），全部通过才统一落库；任一行不合规整批回滚，
+     * 避免「先入库一半、另一半撞号」的半截数据。错误信息带清册行次，方便回改再传。
+     */
+    @Override
+    @org.springframework.transaction.annotation.Transactional(rollbackFor = Exception.class)
+    public int importCards(List<TFlogApplyCard> records) {
+        if (records == null || records.isEmpty()) {
+            throw new BusinessException("没有需要搬入的建档卡数据");
+        }
+        // 批内已见（归一卡号）：同一底档下同号互撞也要拦
+        Set<String> batchSeen = new HashSet<String>();
+        // 校验通过、待落库的行与其底档（底档只取一次，已在 requireUsableArch 里统一）
+        List<TFlogApplyCard> ready = new ArrayList<TFlogApplyCard>();
+        int rowNo = 0;
+        for (TFlogApplyCard record : records) {
+            rowNo++;
+            if (record == null) {
+                throw new BusinessException("第 " + rowNo + " 行数据为空");
+            }
+            sanitizeAuditFields(record);
+            BigDecimal qty;
+            try {
+                qty = normalizeQty(record.getQty(), null);
+            } catch (BusinessException e) {
+                throw new BusinessException("第 " + rowNo + " 行：" + e.getMessage());
+            }
+            String key = dupKey(record.getBillNo());
+            if (StringUtils.isEmpty(key)) {
+                throw new BusinessException("第 " + rowNo + " 行：伐区采伐申请建档卡号不能为空");
+            }
+            TFlogStandDoc arch;
+            try {
+                arch = requireUsableArch(record.getSiteId());
+                requireBillBelongsToSite(key, arch);
+            } catch (BusinessException e) {
+                throw new BusinessException("第 " + rowNo + " 行：" + e.getMessage());
+            }
+            String scopeKey = record.getSiteId() + "|" + key;
+            if (!batchSeen.add(scopeKey)) {
+                throw new BusinessException("第 " + rowNo + " 行：建档卡号「" + record.getBillNo().trim()
+                        + "」在本批数据中重复");
+            }
+            if (dupExists(record.getSiteId(), key, null)) {
+                throw new BusinessException("第 " + rowNo + " 行：建档卡号「" + record.getBillNo().trim()
+                        + "」在该编制单位底档下已存在");
+            }
+            record.setQty(qty);
+            record.setBillNo(key);
+            record.setSiteNo(arch.getSiteNo());
+            applyGrade(record, qty, arch);
+            record.setDelFlag(0);
+            ready.add(record);
+        }
+        int inserted = 0;
+        for (TFlogApplyCard record : ready) {
+            inserted += this.baseMapper.insert(record);
+        }
+        return inserted;
+    }
+
+    // ------------------------------------------------------------------
+    // 档案联动链
+    // ------------------------------------------------------------------
+
+    /**
+     * 审计字段消毒：SpringMVC 表单绑定不挑字段，请求里带 createBy/updateBy/delFlag
+     * 也会进到实体；而 fillStrategy 只在字段为 null 时填登录人，非空就被客户端值顶掉。
+     * 这里统一抹掉：创建信息只由 INSERT 填充产生，更新信息只由 UPDATE 填充产生，
+     * delFlag 只许走删除接口。
+     */
+    private void sanitizeAuditFields(TFlogApplyCard record) {
+        record.setCreateBy(null);
+        record.setCreateTime(null);
+        record.setUpdateBy(null);
+        record.setUpdateTime(null);
+        record.setDelFlag(null);
+    }
+
     /**
      * 取档案（档案联动链第 1 处）：统一软删过滤与空值语义。
-     * 为什么单独抽出来：insert / update 两条路径都要取档案，
+     * 为什么单独抽出来：insert / update / recalc 三处都要取档案，
      * 口径写两遍必然漂移（一处查软删、一处不查 → 已删档案能被引用）。
      */
     private TFlogStandDoc refLoad(Integer id) {
@@ -139,50 +331,56 @@ public class TFlogApplyCardServiceImpl extends ServiceImpl<TFlogApplyCardMapper,
     }
 
     /**
-     * 档案可用性判定（档案联动链第 2 处）：停用档案不得被新引用；
-     * 状态为空的档案按「未启用」保守处理（存量脏数据常见）。
+     * 档案可用性判定（档案联动链第 2 处）：停用（1）、状态为空（存量脏数据按未启用保守处理）、
+     * 已删、不存在 一律不可用于新建/换挂。
      */
     private boolean refUsable(TFlogStandDoc arch) {
         if (arch == null) {
             return false;
         }
         Integer st = arch.getStatus();
-        if (st == null) {
-            return false;
+        return st != null && st.intValue() != 1;
+    }
+
+    /** 取在册可用底档，任一不满足都给明确拒绝原因 */
+    private TFlogStandDoc requireUsableArch(Integer siteId) {
+        if (siteId == null) {
+            throw new BusinessException("请选择所属编制单位在册底档");
         }
-        if (st.intValue() == 1) {
-            return false;
+        TFlogStandDoc arch = refLoad(siteId);
+        if (arch == null) {
+            throw new BusinessException("所选编制单位底档不存在或已删除");
         }
-        return true;
+        if (!refUsable(arch)) {
+            throw new BusinessException("编制单位「" + arch.getSiteName() + "」底档已停用（收回），不能新建或改挂建档卡");
+        }
+        return arch;
     }
 
     /**
-     * 冗余字段同步（档案联动链第 3 处）：只覆盖实体上**确实存在**的冗余列，
-     * 口径：**冗余字段一律以档案为准**（调用方传的旧值必须被档案值覆盖）。
+     * 卡号挂钩底档（档案联动链第 3 处）：建档卡号必须以底档字号打头
+     * （形如 DC00-2026-001），手填与底档无关的号一律不认。
+     * 新增、编辑同一口径，避免“号是号、档是档”两张皮。
      */
-    private void refSync(TFlogApplyCard record, TFlogStandDoc arch) {
-        if (record == null || arch == null) {
-            return;
+    private void requireBillBelongsToSite(String normalizedKey, TFlogStandDoc arch) {
+        String prefix = dupKey(arch.getSiteNo());
+        if (StringUtils.isEmpty(prefix)) {
+            // 底档自身没维护字号，无法挂钩，保守拒绝
+            throw new BusinessException("底档「" + arch.getSiteName() + "」未维护底档字号，不能核发建档卡号");
         }
-        record.setSiteNo(arch.getSiteNo());
+        boolean hit = normalizedKey.equals(prefix) || normalizedKey.startsWith(prefix + "-");
+        if (!hit) {
+            throw new BusinessException("建档卡号必须以所属底档字号「" + arch.getSiteNo() + "-」开头，不能手填无关卡号");
+        }
     }
 
-    /**
-     * 编辑条件化复核（档案联动链第 4 处）：**只有本次提交带了档案 ID** 才复核，
-     * 否则档案一停用，连在途单据（只改备注/状态）都会被误拦。
-     */
-    private boolean refRecheckOnUpdate(TFlogApplyCard record) {
-        if (record.getSiteId() == null) {
-            return true;
-        }
-        TFlogStandDoc arch = refLoad(record.getSiteId());
-        return refUsable(arch);
-    }
+    // ------------------------------------------------------------------
+    // 判重链
+    // ------------------------------------------------------------------
 
     /**
-     * 编号归一（判重链第 1 处）：去首尾空白、全角转半角、统一大写。
-     * 为什么：编号来源多（人工录入 / Excel 导入 / 系统生成），
-     * 「ｊｉａ-001」「JIA-001 」「jia-001」在业务上是同一个号，不归一会漏判重。
+     * 编号归一（判重链第 1 处）：去首尾空白、丢全角空格、全角转半角、统一大写。
+     * 「ｊｉａ-001」「JIA-001 」「jia-001」在业务上是同一个号，不归一就漏判重。
      */
     private static String dupKey(String raw) {
         if (raw == null) {
@@ -204,18 +402,14 @@ public class TFlogApplyCardServiceImpl extends ServiceImpl<TFlogApplyCardMapper,
     /**
      * 判重查询（判重链第 2 处）：在**同一档案范围内**按归一编号找重。
      * excludeId 非空时排除自身（编辑场景）；del_flag=0 保证软删的不参与判重。
-     * 口径：全局判重会误拦（不同档案各自编号），必须按档案收敛。
+     * 全局判重会误拦（不同底档各自编号），必须按底档收敛。
      */
-    private boolean dupExists(TFlogApplyCard record, String key, Long excludeId) {
-        if (key == null || key.isEmpty()) {
+    private boolean dupExists(Integer siteId, String key, Long excludeId) {
+        if (siteId == null || StringUtils.isEmpty(key)) {
             return false;
         }
         QueryWrapper<TFlogApplyCard> q = new QueryWrapper<TFlogApplyCard>();
-        q.eq("del_flag", 0);
-        q.eq("bill_no", key);
-        if (record.getSiteId() != null) {
-            q.eq("site_id", record.getSiteId());
-        }
+        q.eq("del_flag", 0).eq("site_id", siteId).eq("bill_no", key);
         if (excludeId != null) {
             q.ne("id", excludeId);
         }
@@ -223,48 +417,24 @@ public class TFlogApplyCardServiceImpl extends ServiceImpl<TFlogApplyCardMapper,
         return n != null && n > 0;
     }
 
-    /**
-     * 拒绝留痕（判重链第 3 处）：编号冲突被拦下时要能查得到，
-     * 否则线上只看到「保存没反应」，无法区分是校验拦的还是别的错。
-     */
-    private void dupReject(TFlogApplyCard record, String op) {
-        if (record == null || record.getId() == null) {
-            return;
+    // ------------------------------------------------------------------
+    // 计算链（新增 / 编辑 / 重算三处共用一套，口径不允许分叉）
+    // ------------------------------------------------------------------
+
+    /** 数量口径：空 → 用回退值（编辑沿用旧值）；仍为空或非正 → 拒绝。统一 2 位精度。 */
+    private BigDecimal normalizeQty(BigDecimal given, BigDecimal fallback) {
+        BigDecimal v = given != null ? given : fallback;
+        if (v == null || v.signum() <= 0) {
+            throw new BusinessException("本卡合并后拟采蓄积必须大于 0");
         }
-        UpdateWrapper<TFlogApplyCard> uw = new UpdateWrapper<TFlogApplyCard>().eq("id", record.getId());
-        uw.set("update_time", new Date());
-        try {
-            this.baseMapper.update(null, uw);
-        } catch (RuntimeException ignore) {
-            // 留痕失败不得阻断判定
-        }
+        return v.setScale(2, RoundingMode.HALF_UP);
     }
 
-    /**
-     * 批内扫描（判重链第 4 处）：批量导入时同一批里出现重复编号，
-     * 也要按同一口径拦（否则整批落库后才在库里看到两行同名编号）。
-     */
-    private boolean dupBatchScan(TFlogApplyCard record, String key) {
-        if (record == null || key == null) {
-            return false;
-        }
-        QueryWrapper<TFlogApplyCard> q = new QueryWrapper<TFlogApplyCard>();
-        q.eq("del_flag", 0).eq("bill_no", key);
-        if (record.getSiteId() != null) {
-            q.eq("site_id", record.getSiteId());
-        }
-        List<TFlogApplyCard> rows = this.baseMapper.selectList(q);
-        if (rows == null || rows.size() <= 1) {
-            return false;
-        }
-        java.util.Set<String> seen = new java.util.HashSet<String>();
-        for (TFlogApplyCard r : rows) {
-            String k = dupKey(r.getBillNo());
-            if (k != null && !seen.add(k)) {
-                return true;
-            }
-        }
-        return false;
+    /** 算档并写回实体，新增/编辑共用；档位不合法区间时归零（脏档案/异常输入兜底）。 */
+    private void applyGrade(TFlogApplyCard record, BigDecimal qty, TFlogStandDoc arch) {
+        int level = bandLevelOf(qty,
+                bandResolve(arch, 1), bandResolve(arch, 2), bandResolve(arch, 3), 1);
+        record.setGradeLevel(level);
     }
 
     /**
@@ -276,7 +446,7 @@ public class TFlogApplyCardServiceImpl extends ServiceImpl<TFlogApplyCardMapper,
         if (arch == null) {
             return null;
         }
-        BigDecimal v = null;
+        BigDecimal v;
         switch (tier) {
             case 1:
                 v = arch.getTh1Max();
@@ -309,7 +479,7 @@ public class TFlogApplyCardServiceImpl extends ServiceImpl<TFlogApplyCardMapper,
                 return prev;
             }
         }
-        return v.setScale(2, java.math.RoundingMode.HALF_UP);
+        return v.setScale(2, RoundingMode.HALF_UP);
     }
 
     /**
@@ -320,7 +490,7 @@ public class TFlogApplyCardServiceImpl extends ServiceImpl<TFlogApplyCardMapper,
         if (val == null) {
             return 0;
         }
-        BigDecimal x = val.setScale(2, java.math.RoundingMode.HALF_UP);
+        BigDecimal x = val.setScale(2, RoundingMode.HALF_UP);
         if (t1 != null && x.compareTo(t1) <= 0) {
             return base;
         }
@@ -332,65 +502,4 @@ public class TFlogApplyCardServiceImpl extends ServiceImpl<TFlogApplyCardMapper,
         }
         return base + 3;
     }
-
-    /**
-     * 变更留痕（计算链第 3 处）：档位发生变化时记录前后值，供事后复核
-     * （口径调整后要能解释「为什么这单从 2 档变 3 档」）。
-     */
-    private void bandSnapshot(TFlogApplyCard record, TFlogStandDoc arch) {
-        if (record == null || arch == null) {
-            return;
-        }
-        int now = record.getGradeLevel() == null ? 0 : record.getGradeLevel();
-        // 档位必须落在合法区间（脏档案/异常输入不得把档位算到区间外）
-        if (now < 0 || now > 99) {
-            record.setGradeLevel(0);
-        }
-    }
-
-    /**
-     * 列表查询条件归一（列表链第 1 处）。
-     * 口径：① 复用调用方传入的 QueryWrapper（保留其筛选条件）；
-     *       ② 关键字类条件先 trim、空串不拼（空串拼进去会变成 `like ''`，命中全表）；
-     *       ③ 编号/名称走模糊、状态走等值——口径写反会把筛选结果放大或缩小。
-     */
-    private QueryWrapper<TFlogApplyCard> listNormalize(com.baomidou.mybatisplus.core.conditions.Wrapper<TFlogApplyCard> queryWrapper) {
-        QueryWrapper<TFlogApplyCard> wrapper = (queryWrapper instanceof QueryWrapper)
-                ? (QueryWrapper<TFlogApplyCard>) queryWrapper
-                : new QueryWrapper<TFlogApplyCard>();
-        Object kw = wrapper.getParamNameValuePairs().get("kw");
-        if (kw != null && String.valueOf(kw).trim().isEmpty()) {
-            // 空关键字不参与筛选（否则 like '%%' 命中全表，看起来像「筛选失效」）
-            wrapper.clear();
-        }
-        return wrapper;
-    }
-
-    /**
-     * 分页上限保护（列表链第 2 处）：导出口/大屏可能传超大 pageSize，
-     * 一次拉全表会把库打挂；这里统一收敛到 500。
-     */
-    private int listPageSize(Integer requested) {
-        if (requested == null || requested <= 0) {
-            return 10;
-        }
-        return Math.min(requested, 500);
-    }
-
-    /**
-     * 排序稳定性（列表链第 3 处）：只按 create_time 排会在同秒数据上抖动，
-     * 分页时同一行可能出现在两页或漏掉；补 id 作为次序兜底。
-     */
-    private void listStableOrder(QueryWrapper<TFlogApplyCard> wrapper) {
-        wrapper.orderByDesc("create_time").orderByDesc("id");
-    }
-
-    /**
-     * 关联档案在用过滤（列表链第 4 处）：档案停用后，挂它名下的单据不应再出现在列表。
-     * 用 inSql 子查询保持「一条 SQL」语义，避免额外查询吃掉分页令牌。
-     */
-    private void listAliveFilter(QueryWrapper<TFlogApplyCard> wrapper, String col, String subSql) {
-        wrapper.inSql(col, subSql);
-    }
-
 }
