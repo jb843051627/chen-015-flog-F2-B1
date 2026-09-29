@@ -7,6 +7,7 @@ import com.fc.v2.common.domain.ResultTable;
 import com.fc.v2.common.log.Log;
 import com.fc.v2.model.auto.TFlogApplyCard;
 import com.fc.v2.service.ITFlogApplyCardService;
+import com.fc.v2.util.StringUtils;
 import io.swagger.annotations.Api;
 import io.swagger.annotations.ApiOperation;
 import org.apache.shiro.authz.annotation.RequiresPermissions;
@@ -45,6 +46,16 @@ public class FlogApplyCardController extends BaseController {
     @ResponseBody
     public ResultTable list(TFlogApplyCard record) {
         QueryWrapper<TFlogApplyCard> queryWrapper = new QueryWrapper<TFlogApplyCard>();
+        // 编号/小班/伐区/底档字号走模糊，底档/方式/档位/进展走等值；
+        // 口径与其它台账一致，界面筛选必须真的进 SQL，不能查出全表。
+        queryWrapper.like(StringUtils.isNotEmpty(record.getBillNo()), "bill_no", record.getBillNo());
+        queryWrapper.like(StringUtils.isNotEmpty(record.getSubcompNo()), "subcomp_no", record.getSubcompNo());
+        queryWrapper.like(StringUtils.isNotEmpty(record.getCutBlockNo()), "cut_block_no", record.getCutBlockNo());
+        queryWrapper.like(StringUtils.isNotEmpty(record.getSiteNo()), "site_no", record.getSiteNo());
+        queryWrapper.eq(record.getSiteId() != null, "site_id", record.getSiteId());
+        queryWrapper.eq(record.getCutMode() != null, "cut_mode", record.getCutMode());
+        queryWrapper.eq(record.getGradeLevel() != null, "grade_level", record.getGradeLevel());
+        queryWrapper.eq(record.getStatus() != null, "status", record.getStatus());
         startPage();
         com.github.pagehelper.PageInfo<TFlogApplyCard> page =
                 new com.github.pagehelper.PageInfo<TFlogApplyCard>(flogApplyCardService.selectTFlogApplyCardList(queryWrapper));

@@ -110,6 +110,17 @@ public class GlobalExceptionResolver{
     }
     
     /**
+     * 业务参数校验异常（如编号重复、引用了已停用底档）：消息本身就是给用户看的口径，原样返回，
+     * 不套「运行时异常:」前缀。@Log 切面的 @AfterThrowing 仍会把该消息写入操作日志留痕。
+     */
+    @ExceptionHandler(IllegalArgumentException.class)
+    public AjaxResult handleIllegalArgument(IllegalArgumentException e)
+    {
+        logger.warn("业务参数校验异常: {}", e.getMessage());
+        return AjaxResult.error(e.getMessage());
+    }
+
+    /**
      * 拦截未知的运行时异常
      */
     @ExceptionHandler(RuntimeException.class)
